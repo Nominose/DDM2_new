@@ -16,7 +16,7 @@
       "name": "ct",
       "dataroot": "/host/d/file/fixedCT_static_simulation_train_test_gaussian_local.xlsx",
       "data_root": "/host/d/file/simulation/",
-      "train_batches": [5],
+      "train_batches": [0,1,2,3,4],
       "val_batches": [5],
       "valid_mask": [0, 1000],
       "slice_range": [30, 80],
