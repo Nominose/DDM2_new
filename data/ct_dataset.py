@@ -455,10 +455,7 @@ class CTDataset(Dataset):
                 slice_idx
             )
 
-        if self.phase == 'train' and random.random() > 0.5:
-            input_img, target_img = n1, n0
-        else:
-            input_img, target_img = n0, n1
+        input_img, target_img = n0, n1
 
         if self.padding > 0:
             cond_ch = 2 * self.padding

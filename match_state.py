@@ -32,8 +32,8 @@ def _rev_warmup_beta(linear_start, linear_end, n_timestep, warmup_frac):
 parser = argparse.ArgumentParser()
 parser.add_argument('-c', '--config', type=str, default='config/sr_sr3_16_128.json',
                     help='JSON file for configuration')
-parser.add_argument('-p', '--phase', type=str, choices=['train', 'val'],
-                    help='Run either train(training) or val(generation)', default='train')
+parser.add_argument('-p', '--phase', type=str, choices=['train', 'val', 'all'],
+                    help='Run train, val, or all (both)', default='all')
 parser.add_argument('-gpu', '--gpu_ids', type=str, default=None)
 parser.add_argument('--debug', action='store_true')
 
@@ -55,9 +55,12 @@ logger = logging.getLogger('base')
 logger.info('[Stage 2] Markov chain state matching (using teacher N2N)!')
 
 # dataset
+train_set, train_loader = None, None
+val_set, val_loader = None, None
+
 for phase, dataset_opt in opt['datasets'].items():
     dataset_opt['initial_stage_file'] = None
-    if phase == 'train' and args.phase != 'val':
+    if phase == 'train':
         train_set = Data.create_dataset(dataset_opt, phase)
         train_loader = Data.create_dataloader(
             train_set, dataset_opt, phase)
@@ -85,62 +88,73 @@ sqrt_alphas_cumprod_prev_np = np.sqrt(
 sqrt_alphas_cumprod_prev = to_torch(np.sqrt(
             np.append(1., alphas_cumprod)))
 
-idx = 0
-stage_file = open(opt['stage2_file'],'w+')
-for _,  data in tqdm(enumerate(val_loader)):
-    idx += 1
-    
-    # ====== 修复：从 val_set.samples 获取正确的 volume_idx 和 slice_idx ======
-    volume_idx, slice_idx = val_set.samples[idx - 1]
-    
-    # ====== 修复：直接使用 ct_dataset 加载的 denoised（已处理 slice 偏移）======
-    if 'denoised' not in data:
-        stage_file.write('%d_%d_%d\n' % (volume_idx, slice_idx, 500))
-        continue
-    
-    denoised = data['denoised'].cuda()
-    # ========================================================================
 
-    max_lh = -1
-    max_t = -1
-    min_lh = 999
-    min_t = -1
-    prev_diff = 999.
-    
-    for t in range(sqrt_alphas_cumprod_prev.shape[0]): # linear search with early stopping
-        noise = data['X'].cuda() - sqrt_alphas_cumprod_prev[t] * denoised
-        noise_mean = torch.mean(noise)
-        noise = noise - noise_mean
-
-        mu, std = norm.fit(noise.cpu().numpy())
-
-        diff = np.abs((1 - sqrt_alphas_cumprod_prev[t]**2).sqrt().cpu().numpy() - std)
-
-        if diff < min_lh:
-            min_lh = diff
-            min_t = t
-
-        if diff > prev_diff:
-            break # find a match!
-        else:
-            prev_diff = diff
-
-    if idx == 30 and args.debug:
-        noise = torch.randn_like(denoised)
-        result = sqrt_alphas_cumprod_prev[min_t] * denoised.detach() + (1. - sqrt_alphas_cumprod_prev[min_t]**2).sqrt() * noise
-        denoised_np = denoised.detach().cpu().numpy()[0,0]
-        input_np = data['X'].detach().cpu().numpy()[0,0]
-        result_np = result.detach().cpu().numpy()[0,0]
-
-        result_np = (result_np + 1.) / 2.
-        input_np = (input_np + 1.) / 2.
-        plt.imshow(np.hstack((input_np, result_np, denoised_np)), cmap='gray')
-        plt.show()
+def match_samples(loader, dataset, stage_file, desc="Matching"):
+    """对一个数据集进行状态匹配"""
+    idx = 0
+    for _, data in tqdm(enumerate(loader), desc=desc, total=len(loader)):
+        idx += 1
         
-        print(min_t, np.max(result_np), np.min(result_np))
-        break
-    
-    stage_file.write('%d_%d_%d\n' % (volume_idx, slice_idx, min_t))
+        # 从 dataset.samples 获取正确的 volume_idx 和 slice_idx
+        volume_idx, slice_idx = dataset.samples[idx - 1]
+        
+        # 直接使用 ct_dataset 加载的 denoised（已处理 slice 偏移）
+        if 'denoised' not in data:
+            stage_file.write('%d_%d_%d\n' % (volume_idx, slice_idx, 500))
+            continue
+        
+        denoised = data['denoised'].cuda()
+
+        min_lh = 999
+        min_t = -1
+        prev_diff = 999.
+        
+        for t in range(sqrt_alphas_cumprod_prev.shape[0]): # linear search with early stopping
+            noise = data['X'].cuda() - sqrt_alphas_cumprod_prev[t] * denoised
+            noise_mean = torch.mean(noise)
+            noise = noise - noise_mean
+
+            mu, std = norm.fit(noise.cpu().numpy())
+
+            diff = np.abs((1 - sqrt_alphas_cumprod_prev[t]**2).sqrt().cpu().numpy() - std)
+
+            if diff < min_lh:
+                min_lh = diff
+                min_t = t
+
+            if diff > prev_diff:
+                break # find a match!
+            else:
+                prev_diff = diff
+
+        if idx == 30 and args.debug:
+            noise = torch.randn_like(denoised)
+            result = sqrt_alphas_cumprod_prev[min_t] * denoised.detach() + (1. - sqrt_alphas_cumprod_prev[min_t]**2).sqrt() * noise
+            denoised_np = denoised.detach().cpu().numpy()[0,0]
+            input_np = data['X'].detach().cpu().numpy()[0,0]
+            result_np = result.detach().cpu().numpy()[0,0]
+
+            result_np = (result_np + 1.) / 2.
+            input_np = (input_np + 1.) / 2.
+            plt.imshow(np.hstack((input_np, result_np, denoised_np)), cmap='gray')
+            plt.show()
+            
+            print(min_t, np.max(result_np), np.min(result_np))
+            break
+        
+        stage_file.write('%d_%d_%d\n' % (volume_idx, slice_idx, min_t))
+
+
+# 执行匹配
+stage_file = open(opt['stage2_file'], 'w+')
+
+if args.phase in ['train', 'all'] and train_loader is not None:
+    logger.info(f'Matching train set ({len(train_set)} samples)...')
+    match_samples(train_loader, train_set, stage_file, desc="Train")
+
+if args.phase in ['val', 'all'] and val_loader is not None:
+    logger.info(f'Matching val set ({len(val_set)} samples)...')
+    match_samples(val_loader, val_set, stage_file, desc="Val")
 
 stage_file.close()
 print('done!')
